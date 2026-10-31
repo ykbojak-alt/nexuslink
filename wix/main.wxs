@@ -3,15 +3,15 @@
      Manufacturer, CargoTargetBinDir, Platform) are injected by cargo-wix. -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*"
-           Name="$(var.ProductName)"
+           Name="NexusLink"
            Language="1033"
            Version="$(var.Version)"
-           Manufacturer="$(var.Manufacturer)"
+           Manufacturer="NexusLink"
            UpgradeCode="7d4e6b2a-9c31-4f5e-8a2d-1b3c5e7f9a01">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
              Description="NexusLink — local AI gateway (Anthropic → OpenAI) + desktop panel"
-             Comments="https://github.com/nexuslink/nexuslink"
-             Manufacturer="$(var.Manufacturer)"/>
+             Comments="https://github.com/ykbojak-alt/nexuslink"
+             Manufacturer="NexusLink"/>
     <MediaTemplate EmbedCab="yes"/>
     <MajorUpgrade DowngradeErrorMessage="A newer version of NexusLink is already installed." />
     <Icon Id="AppIco" SourceFile="..\assets\nexuslink.ico" />
