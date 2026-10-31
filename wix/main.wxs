@@ -20,10 +20,6 @@
       <ComponentGroupRef Id="Binaries"/>
       <ComponentRef Id="DesktopShortcut"/>
     </Feature>
-
-    <InstallExecuteSequence>
-      <RemoveExistingProducts After="InstallValidate"/>
-    </InstallExecuteSequence>
   </Product>
 
   <Fragment>
