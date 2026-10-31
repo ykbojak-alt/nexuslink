@@ -1,0 +1,42 @@
+[package]
+name = "nexuslink"
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "NexusLink — local API gateway with provider/key rotation: translates Anthropic /v1/messages into OpenAI /v1/chat/completions for Claude Desktop"
+
+[dependencies]
+axum = { version = "0.8", features = ["json", "http2"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "charset"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+futures-util = "0.3"
+tokio-stream = "0.1"
+eventsource-stream = "0.2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wry = "0.57.1"
+tao = "0.37.2"
+tray-icon = "0.26.1"
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+embed-resource = "3"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+# Single-file release build: fat LTO + one codegen unit + stripped symbols.
+# Nothing external is needed at runtime — config lives in ~/.nexuslink by
+# design, the SPA is include_str!-embedded, TLS is rustls (no DLLs).
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+opt-level = 3

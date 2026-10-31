@@ -1,0 +1,6 @@
+target/
+*.exe
+*.WebView2/
+.devtmp/
+wix/*.wixobj
+wix/*.wixpdb

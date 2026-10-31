@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- NexusLink MSI — consumed by `cargo wix`. Variables (ProductName, Version,
+     Manufacturer, CargoTargetBinDir, Platform) are injected by cargo-wix. -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="$(var.ProductName)"
+           Language="1033"
+           Version="$(var.Version)"
+           Manufacturer="$(var.Manufacturer)"
+           UpgradeCode="7d4e6b2a-9c31-4f5e-8a2d-1b3c5e7f9a01">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
+             Description="NexusLink — local AI gateway (Anthropic → OpenAI) + desktop panel"
+             Comments="https://github.com/nexuslink/nexuslink"
+             Manufacturer="$(var.Manufacturer)"/>
+    <MajorUpgrade DowngradeErrorMessage="A newer version of NexusLink is already installed." />
+    <MediaTemplate EmbedCab="yes"/>
+    <Icon Id="nexuslink.ico" SourceFile="..\assets\nexuslink.ico" />
+
+    <Feature Id="MainProgram" Title="NexusLink" Level="1" Description="The gateway, panel app, MCP server and CLI">
+      <ComponentGroupRef Id="Binaries"/>
+      <ComponentRef Id="DesktopShortcut"/>
+    </Feature>
+
+    <InstallExecuteSequence>
+      <RemoveExistingProducts After="InstallValidate"/>
+    </InstallExecuteSequence>
+  </Product>
+
+  <Fragment>
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLDIR" Name="NexusLink"/>
+      </Directory>
+      <Directory Id="DesktopFolder"/>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="NexusLinkMenu" Name="NexusLink"/>
+      </Directory>
+    </Directory>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="Binaries">
+      <Component Id="nexuslink.exe" Guid="2a3c4f5e-6b7d-48a1-9c2d-3e4f5a6b7c8d" Directory="INSTALLDIR">
+        <File Id="nexuslink.exe" Source="$(var.CargoTargetBinDir)\nexuslink.exe" KeyPath="yes" Checksum="yes"/>
+      </Component>
+      <Component Id="nexuslink.ico" Guid="3b4d5a6f-7c8e-49b2-ad3e-4f5a6b7c8d9e" Directory="INSTALLDIR">
+        <File Id="nexuslink.ico" Source="..\assets\nexuslink.ico"/>
+        <RegistryValue Root="HKCU" Key="Software\NexusLink" Name="installed" Type="integer" Value="1" KeyPath="yes"/>
+      </Component>
+    </ComponentGroup>
+
+    <Component Id="DesktopShortcut" Guid="4c5e6b7a-8d9f-4ac3-be4f-5a6b7c8d9e0f" Directory="DesktopFolder">
+      <Shortcut Id="DesktopShortcut"
+                Name="NexusLink"
+                Description="NexusLink — local AI gateway"
+                Target="[INSTALLDIR]nexuslink.exe"
+                Arguments="app"
+                WorkingDirectory="INSTALLDIR"
+                Icon="nexuslink.ico"
+                IconIndex="0"/>
+      <Shortcut Id="MenuShortcut"
+                Name="NexusLink"
+                Description="NexusLink — local AI gateway"
+                Directory="NexusLinkMenu"
+                Target="[INSTALLDIR]nexuslink.exe"
+                Arguments="app"
+                WorkingDirectory="INSTALLDIR"
+                Icon="nexuslink.ico"
+                IconIndex="0"/>
+      <RemoveFolder Id="DesktopFolder" On="uninstall"/>
+      <RemoveFolder Id="NexusLinkMenu" On="uninstall"/>
+      <RegistryValue Root="HKCU" Key="Software\NexusLink" Name="shortcut" Type="integer" Value="1" KeyPath="yes"/>
+    </Component>
+  </Fragment>
+</Wix>
