@@ -63,7 +63,7 @@ jobs:
       - name: Bundle .app + .dmg
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          packaging/macos/bundle.sh target/universal/nexuslink "$VERSION"
+          bash packaging/macos/bundle.sh target/universal/nexuslink "$VERSION"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2

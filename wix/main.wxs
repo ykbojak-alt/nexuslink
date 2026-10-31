@@ -12,8 +12,8 @@
              Description="NexusLink — local AI gateway (Anthropic → OpenAI) + desktop panel"
              Comments="https://github.com/nexuslink/nexuslink"
              Manufacturer="$(var.Manufacturer)"/>
-    <MajorUpgrade DowngradeErrorMessage="A newer version of NexusLink is already installed." />
     <MediaTemplate EmbedCab="yes"/>
+    <MajorUpgrade DowngradeErrorMessage="A newer version of NexusLink is already installed." />
     <Icon Id="nexuslink.ico" SourceFile="..\assets\nexuslink.ico" />
 
     <Feature Id="MainProgram" Title="NexusLink" Level="1" Description="The gateway, panel app, MCP server and CLI">
