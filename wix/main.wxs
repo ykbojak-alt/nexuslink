@@ -14,7 +14,7 @@
              Manufacturer="NexusLink"/>
     <MediaTemplate EmbedCab="yes"/>
     <MajorUpgrade DowngradeErrorMessage="A newer version of NexusLink is already installed." />
-    <Icon Id="AppIco" SourceFile="..\assets\nexuslink.ico" />
+    <Icon Id="AppIco" SourceFile="assets\nexuslink.ico" />
 
     <Feature Id="MainProgram" Title="NexusLink" Level="1" Description="The gateway, panel app, MCP server and CLI">
       <ComponentGroupRef Id="Binaries"/>
@@ -40,7 +40,7 @@
         <File Id="nexuslink.exe" Source="$(var.CargoTargetBinDir)\nexuslink.exe" KeyPath="yes" Checksum="yes"/>
       </Component>
       <Component Id="IcoComponent" Guid="3b4d5a6f-7c8e-49b2-ad3e-4f5a6b7c8d9e" Directory="INSTALLDIR">
-        <File Id="IcoFile" Source="..\assets\nexuslink.ico"/>
+        <File Id="IcoFile" Source="assets\nexuslink.ico"/>
         <RegistryValue Root="HKCU" Key="Software\NexusLink" Name="installed" Type="integer" Value="1" KeyPath="yes"/>
       </Component>
     </ComponentGroup>
