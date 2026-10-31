@@ -26,7 +26,7 @@ into OpenAI-compatible requests for pooled upstream providers — Claude Desktop
 | `src/main.rs` | CLI dispatch, AttachConsole pipe-detection, `windows_subsystem` |
 | `src/gateway.rs` | `apply` — writes Claude configs (3p + satellites + `~/.claude.json`) |
 | `src/proxy.rs` | AppState, rotation, fallback, auto-compaction, `state_from_config` |
-| `src/desktop.rs` | frameless tao/wry shell, DWM rounded corners, injected titlebar JS, tray |
+| `src/desktop.rs` | frameless tao/wry shell, DWM rounded corners, injected titlebar JS, tray, `~/.nexuslink/window.json` geometry sidecar |
 | `src/mcp.rs` | stdio MCP server (separate thread + own tokio runtime — do NOT `block_on` inside the main runtime) |
 | `src/translator.rs` | Anthropic ↔ OpenAI translation, SSE |
 | `src/config.rs` | config model (`~/.nexuslink/config.json`), `ModelEntry.context`, `Provider.auto_compact` |
@@ -115,22 +115,31 @@ Verify: `curl http://127.0.0.1:5679/health` → `ok`, `Get-Process nexuslink` sh
 - Screenshotting the real window (`PrintWindow`, flag 2) captures the panel **with the
   operator's real keys and incoming token in plain text** — crop to the titlebar strip
   before sharing, never attach the full client area.
+- The WebView2 context menu is not observable from outside: it is not a top-level window
+  (`list_windows` stays empty) and not in the host UIA tree, and per-window capture skips
+  popups. Don't treat "no menu appeared" as evidence — check the wry settings call instead.
 
 ## Improvement backlog (pick from here or propose better)
 
 1. ~~**Dev-loop for UI**~~ — done: debug serves `ui/index.html` and `assets/panel-bg.webp`
    from disk (`/ui/bg.webp`), release embeds both.
-2. **Window state**: persist size/position/maximized to `~/.nexuslink/window.json`,
-   restore on launch.
+2. ~~**Window state**~~ — done: geometry lives in `~/.nexuslink/window.json`
+   (`WindowState` in `src/desktop.rs`, path helper in `config.rs`). Saved on
+   `Resized`/`Moved` with a 400 ms debounce (`ControlFlow::WaitUntil`) and flushed
+   immediately on hide/quit; a rect that no longer intersects any monitor is dropped
+   so the OS places the window (unplugged-monitor case); while maximized only the
+   flag is stored, because a maximized rect overshoots the monitor.
 3. **Single-instance**: `nexuslink app` should focus the existing window instead of
    opening a second one (mutex/named event).
 4. **Video MCP**: add `mode: "reference"` support to `generate_video` (images ≤5,
    audios ≤3 per Agnes docs); maybe expose `size` tiers if the plan allows.
 5. **Metrics page**: render per-key success rate/EMA latency in the panel
    (`/api/status` already returns `metrics`); optionally persist counters to disk.
-6. **Context menu / zoom**: disable WebView2 default right-click + pinch-zoom for
-   a more app-like feel (`AreDefaultContextMenusEnabled`, `IsZoomControlEnabled`
-   via `with_browser_accelerator_keys_disabled` / ICoreWebView2Settings — check wry API).
+6. ~~**Context menu / zoom**~~ — done: `with_hotkeys_zoom(false)` (no ctrl/pinch page zoom)
+   and `hide_browser_chrome()` → `with_default_context_menus(false)` in `src/desktop.rs`.
+   wry calls `SetAreDefaultContextMenusEnabled`/`SetIsZoomControlEnabled` with `?` during
+   `WebView::build` (wry-0.57.1 `webview2/mod.rs:484`), so a rejected value would take the
+   whole panel down — a rendering window is the proof the settings stuck.
 7. **Autostart**: Settings toggle → registry `HKCU\Run` entry for `nexuslink app`.
 8. **Tray polish**: show live stats in tooltip (providers/blacklist size), maybe a
    quick "Открыть панель / Health / Выход" menu item.

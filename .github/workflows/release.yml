@@ -25,7 +25,7 @@ jobs:
         run: cargo install cargo-wix --locked
 
       - name: Build MSI
-        run: cargo wix --package nexuslink
+        run: cargo wix --package nexuslink --nocapture
 
       - name: Zip the standalone exe
         shell: pwsh

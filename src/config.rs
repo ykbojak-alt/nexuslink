@@ -290,6 +290,12 @@ pub fn config_path() -> PathBuf {
     PathBuf::from(home_dir()).join(".nexuslink").join("config.json")
 }
 
+/// Window geometry sidecar. Deliberately not inside `config.json`: it churns on
+/// every drag and resize, and it is not operator intent worth versioning.
+pub fn window_state_path() -> PathBuf {
+    PathBuf::from(home_dir()).join(".nexuslink").join("window.json")
+}
+
 /// Pre-rename config location, honored on read only.
 fn legacy_config_path() -> PathBuf {
     PathBuf::from(home_dir()).join(".openbridge").join("config.json")

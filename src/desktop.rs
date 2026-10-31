@@ -8,6 +8,7 @@
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::window::WindowBuilder;
@@ -33,6 +34,108 @@ enum Ctl {
     Max,
     Close,
     Drag,
+}
+
+/// Last window geometry, persisted to `~/.nexuslink/window.json`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct WindowState {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    #[serde(default)]
+    maximized: bool,
+}
+
+/// A screen in the same physical pixels tao reports.
+#[derive(Debug, Clone, Copy)]
+struct MonitorRect {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+}
+
+/// How much of the window has to land on a screen for a restore to be trusted:
+/// wide enough to grab the titlebar, short enough that a monitor change can't
+/// strand the panel off-screen with no way back.
+const ON_SCREEN_SLIVER: i32 = 60;
+
+impl WindowState {
+    fn load() -> Option<Self> {
+        let path = crate::config::window_state_path();
+        let raw = std::fs::read_to_string(&path).ok()?;
+        match serde_json::from_str::<WindowState>(&raw) {
+            Ok(st) => Some(st),
+            Err(e) => {
+                tracing::warn!("ignoring unreadable {} ({e})", path.display());
+                None
+            }
+        }
+    }
+
+    fn save(&self) {
+        let path = crate::config::window_state_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match serde_json::to_string(self) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    tracing::warn!("window state not saved to {} ({e})", path.display());
+                }
+            }
+            Err(e) => tracing::warn!("window state not serialized ({e})"),
+        }
+    }
+
+    /// None means "let the OS place the window": the saved rect hangs off every
+    /// screen we can see right now, usually because a monitor was unplugged.
+    fn on_screen(self, monitors: &[MonitorRect]) -> Option<Self> {
+        let fits = monitors.iter().any(|m| {
+            self.x > m.x
+                && self.x < m.x + m.w as i32 - ON_SCREEN_SLIVER
+                && self.y >= m.y
+                && self.y <= m.y + m.h as i32 - ON_SCREEN_SLIVER
+        });
+        fits.then_some(self)
+    }
+}
+
+/// Geometry snapshot for the sidecar. While maximized, Windows reports a rect
+/// that overshoots the monitor, so keep the restored rect we already know and
+/// store only the flag. A minimized window reports a useless rect too.
+fn snapshot(window: &tao::window::Window, prev: Option<WindowState>) -> Option<WindowState> {
+    if window.is_minimized() {
+        return None;
+    }
+    if window.is_maximized() {
+        let mut st = prev.unwrap_or_default();
+        st.maximized = true;
+        if st.w == 0 || st.h == 0 {
+            let size = window.inner_size();
+            st.w = size.width;
+            st.h = size.height;
+        }
+        return Some(st);
+    }
+    let pos = window.outer_position().ok()?;
+    let size = window.inner_size();
+    Some(WindowState {
+        x: pos.x,
+        y: pos.y,
+        w: size.width,
+        h: size.height,
+        maximized: false,
+    })
+}
+
+/// Write the pending geometry now — used on hide and quit, where the loop may
+/// not run another event before the process is gone.
+fn flush_state(pending: &mut Option<WindowState>) {
+    if let Some(st) = pending.take() {
+        st.save();
+    }
 }
 
 /// WebView2's own right-click menu ("Inspect", "Back", "Print"…) has no place in
@@ -191,15 +294,35 @@ pub fn run_app(cfg: Config) -> anyhow::Result<()> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
-    let window = WindowBuilder::new()
+    let monitors: Vec<MonitorRect> = event_loop
+        .available_monitors()
+        .map(|m| {
+            let (pos, size) = (m.position(), m.size());
+            MonitorRect {
+                x: pos.x,
+                y: pos.y,
+                w: size.width,
+                h: size.height,
+            }
+        })
+        .collect();
+    let restored = WindowState::load().and_then(|st| st.on_screen(&monitors));
+
+    let mut builder = WindowBuilder::new()
         .with_title("NexusLink")
         .with_decorations(false)
-        .with_inner_size(tao::dpi::LogicalSize::new(1180.0_f64, 780.0_f64))
         .with_min_inner_size(tao::dpi::LogicalSize::new(760.0_f64, 520.0_f64))
         .with_window_icon(
             tao::window::Icon::from_rgba(ICON_RGBA.to_vec(), ICON_SIZE, ICON_SIZE).ok(),
-        )
-        .build(&event_loop)?;
+        );
+    builder = match restored {
+        Some(st) => builder
+            .with_position(tao::dpi::PhysicalPosition::new(st.x, st.y))
+            .with_inner_size(tao::dpi::PhysicalSize::new(st.w, st.h))
+            .with_maximized(st.maximized),
+        None => builder.with_inner_size(tao::dpi::LogicalSize::new(1180.0_f64, 780.0_f64)),
+    };
+    let window = builder.build(&event_loop)?;
     dress_window(&window);
 
     let ipc_proxy = proxy.clone();
@@ -264,21 +387,44 @@ pub fn run_app(cfg: Config) -> anyhow::Result<()> {
         }
     });
 
+    // Debounced geometry save: a drag fires Moved continuously, and the file is
+    // a sidecar, not something worth writing 60 times a second.
+    let mut pending = snapshot(&window, restored);
+    let mut flush_at = Instant::now();
+
     event_loop.run(move |event, _elwt, control| {
         *control = ControlFlow::Wait;
+        if pending.is_some() {
+            if Instant::now() >= flush_at {
+                flush_state(&mut pending);
+            } else {
+                *control = ControlFlow::WaitUntil(flush_at);
+            }
+        }
         match event {
             // X hides to the tray — the gateway keeps serving in background.
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
+                flush_state(&mut pending);
                 if has_tray {
                     window.set_visible(false);
                 } else {
                     *control = ControlFlow::Exit;
                 }
             }
+            Event::WindowEvent {
+                event: WindowEvent::Resized(_) | WindowEvent::Moved(_),
+                ..
+            } => {
+                if let Some(st) = snapshot(&window, pending) {
+                    pending = Some(st);
+                    flush_at = Instant::now() + Duration::from_millis(400);
+                }
+            }
             Event::UserEvent(UserEvent::Menu(m)) if m.id == quit_id => {
+                flush_state(&mut pending);
                 *control = ControlFlow::Exit;
             }
             Event::UserEvent(UserEvent::Menu(m)) if m.id == open_id => {
@@ -297,6 +443,7 @@ pub fn run_app(cfg: Config) -> anyhow::Result<()> {
                 }
             }
             Event::UserEvent(UserEvent::Ctl(Ctl::Close)) => {
+                flush_state(&mut pending);
                 if has_tray {
                     window.set_visible(false);
                 } else {
@@ -318,4 +465,67 @@ pub fn run_app(cfg: Config) -> anyhow::Result<()> {
             _ => {}
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn primary() -> MonitorRect {
+        MonitorRect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        }
+    }
+
+    fn st(x: i32, y: i32) -> WindowState {
+        WindowState {
+            x,
+            y,
+            w: 1180,
+            h: 780,
+            maximized: false,
+        }
+    }
+
+    #[test]
+    fn restores_geometry_that_still_sits_on_a_screen() {
+        assert_eq!(st(120, 80).on_screen(&[primary()]), Some(st(120, 80)));
+    }
+
+    #[test]
+    fn drops_geometry_left_off_an_unplugged_monitor() {
+        assert_eq!(st(4200, 900).on_screen(&[primary()]), None);
+        assert_eq!(st(1900, 40).on_screen(&[primary()]), None);
+        assert_eq!(st(40, 1200).on_screen(&[primary()]), None);
+    }
+
+    #[test]
+    fn honors_a_second_monitor_at_negative_coordinates() {
+        let left = MonitorRect {
+            x: -2560,
+            y: 0,
+            w: 2560,
+            h: 1440,
+        };
+        assert_eq!(st(-1400, 200).on_screen(&[primary(), left]), Some(st(-1400, 200)));
+    }
+
+    #[test]
+    fn sidecar_still_loads_without_the_maximized_flag() {
+        let old: WindowState =
+            serde_json::from_str(r#"{"x":1,"y":2,"w":3,"h":4}"#).expect("legacy sidecar");
+        assert_eq!(
+            old,
+            WindowState {
+                x: 1,
+                y: 2,
+                w: 3,
+                h: 4,
+                maximized: false
+            }
+        );
+    }
 }

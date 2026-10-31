@@ -1,5 +1,7 @@
 # NexusLink
 
+[Русская версия → README.ru.md](README.ru.md)
+
 Local API gateway that lets **Claude Desktop** talk to **any OpenAI-compatible
 provider** (OpenRouter, Groq, Ollama, vLLM, LM Studio, together.ai, …) — with
 provider/key rotation, a built-in management panel, and honest failure modes.

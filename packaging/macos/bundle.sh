@@ -4,7 +4,7 @@
 # Runs entirely on system tools: lipo, sips, iconutil, hdiutil.
 set -euo pipefail
 
-BIN="${1:?path to the (lipo'd) nexuslink binary}"
+BIN="${1:?usage: bundle.sh <universal-binary> <version>}"
 VERSION="${2:-0.2.0}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="$ROOT/target/bundle"
