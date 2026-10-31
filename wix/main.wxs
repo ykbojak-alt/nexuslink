@@ -9,7 +9,7 @@
            Manufacturer="NexusLink"
            UpgradeCode="7d4e6b2a-9c31-4f5e-8a2d-1b3c5e7f9a01">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
-             Description="NexusLink — local AI gateway (Anthropic → OpenAI) + desktop panel"
+             Description="NexusLink - local AI gateway (Anthropic to OpenAI) + desktop panel"
              Comments="https://github.com/ykbojak-alt/nexuslink"
              Manufacturer="NexusLink"/>
     <MediaTemplate EmbedCab="yes"/>
@@ -48,7 +48,7 @@
     <Component Id="DesktopShortcut" Guid="4c5e6b7a-8d9f-4ac3-be4f-5a6b7c8d9e0f" Directory="DesktopFolder">
       <Shortcut Id="DesktopShortcut"
                 Name="NexusLink"
-                Description="NexusLink — local AI gateway"
+                Description="NexusLink - local AI gateway"
                 Target="[INSTALLDIR]nexuslink.exe"
                 Arguments="app"
                 WorkingDirectory="INSTALLDIR"
@@ -56,7 +56,7 @@
                 IconIndex="0"/>
       <Shortcut Id="MenuShortcut"
                 Name="NexusLink"
-                Description="NexusLink — local AI gateway"
+                Description="NexusLink - local AI gateway"
                 Directory="NexusLinkMenu"
                 Target="[INSTALLDIR]nexuslink.exe"
                 Arguments="app"
