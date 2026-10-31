@@ -38,13 +38,15 @@ studied in ccMesh (Apache-2.0); everything here is original code, Apache-2.0.
 
 ## Install
 
-**Windows** — grab `nexuslink-*-windows-x86_64.msi` from
-[Releases](../../releases) for a proper installer (Start-menu + desktop
-shortcuts), or the standalone `nexuslink-*-windows-x86_64.zip` — one exe, zero
-dependencies, drop it anywhere.
+Grab an installer from [Releases](../../releases/latest):
 
-**macOS** — `nexuslink-*-macos-universal.dmg` (Apple Silicon + Intel,
-unsigned: right-click → Open on first launch).
+| Platform | File | v0.2.0 |
+|---|---|---|
+| Windows | `.msi` installer (Start-menu + desktop shortcuts) | [download](../../releases/download/v0.2.0/nexuslink-0.2.0-x86_64.msi) |
+| Windows | `.zip` standalone exe, zero dependencies | [download](../../releases/download/v0.2.0/nexuslink-0.2.0-windows-x86_64.zip) |
+| macOS | `.dmg` universal — Apple Silicon + Intel | [download](../../releases/download/v0.2.0/nexuslink-0.2.0-macos-universal.dmg) |
+
+The macOS bundle is unsigned: right-click → **Open** on first launch.
 
 **From source**
 

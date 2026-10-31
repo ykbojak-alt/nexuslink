@@ -40,13 +40,15 @@ ccMesh (Apache-2.0); весь код здесь оригинальный, Apache
 
 ## Установка
 
-**Windows** — берите `nexuslink-*-windows-x86_64.msi` из
-[Releases](../../releases) (полноценный инсталлер: ярлыки в меню «Пуск» и на
-рабочем столе) или standalone `nexuslink-*-windows-x86_64.zip` — один exe,
-ноль зависимостей, кладите куда угодно.
+Берите установщик из [Releases](../../releases/latest):
 
-**macOS** — `nexuslink-*-macos-universal.dmg` (Apple Silicon + Intel; сборка
-без подписи разработчика — первый запуск: правый клик → Открыть).
+| Платформа | Файл | v0.2.0 |
+|---|---|---|
+| Windows | `.msi` установщик (ярлыки в «Пуске» и на рабочем столе) | [скачать](../../releases/download/v0.2.0/nexuslink-0.2.0-x86_64.msi) |
+| Windows | `.zip` — один exe, ноль зависимостей | [скачать](../../releases/download/v0.2.0/nexuslink-0.2.0-windows-x86_64.zip) |
+| macOS | `.dmg` universal — Apple Silicon + Intel | [скачать](../../releases/download/v0.2.0/nexuslink-0.2.0-macos-universal.dmg) |
+
+Сборка для macOS без подписи разработчика — первый запуск: правый клик → **Открыть**.
 
 **Из исходников**
 
