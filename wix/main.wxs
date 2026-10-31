@@ -18,6 +18,7 @@
 
     <Feature Id="MainProgram" Title="NexusLink" Level="1" Description="The gateway, panel app, MCP server and CLI">
       <ComponentGroupRef Id="Binaries"/>
+      <ComponentRef Id="MenuShortcut"/>
       <ComponentRef Id="DesktopShortcut"/>
     </Feature>
   </Product>
@@ -45,27 +46,33 @@
       </Component>
     </ComponentGroup>
 
-    <Component Id="DesktopShortcut" Guid="4c5e6b7a-8d9f-4ac3-be4f-5a6b7c8d9e0f" Directory="DesktopFolder">
-      <Shortcut Id="DesktopShortcut"
-                Name="NexusLink"
-                Description="NexusLink - local AI gateway"
-                Target="[INSTALLDIR]nexuslink.exe"
-                Arguments="app"
-                WorkingDirectory="INSTALLDIR"
-                Icon="AppIco"
-                IconIndex="0"/>
-      <Shortcut Id="MenuShortcut"
-                Name="NexusLink"
-                Description="NexusLink - local AI gateway"
-                Directory="NexusLinkMenu"
-                Target="[INSTALLDIR]nexuslink.exe"
-                Arguments="app"
-                WorkingDirectory="INSTALLDIR"
-                Icon="AppIco"
-                IconIndex="0"/>
-      <RemoveFolder Id="DesktopFolder" On="uninstall"/>
-      <RemoveFolder Id="NexusLinkMenu" On="uninstall"/>
-      <RegistryValue Root="HKCU" Key="Software\NexusLink" Name="shortcut" Type="integer" Value="1" KeyPath="yes"/>
-    </Component>
+    <DirectoryRef Id="NexusLinkMenu">
+      <Component Id="MenuShortcut" Guid="4c5e6b7a-8d9f-4ac3-be4f-5a6b7c8d9e0f">
+        <Shortcut Id="MenuShortcut"
+                  Name="NexusLink"
+                  Description="NexusLink - local AI gateway"
+                  Target="[INSTALLDIR]nexuslink.exe"
+                  Arguments="app"
+                  WorkingDirectory="INSTALLDIR"
+                  Icon="AppIco"
+                  IconIndex="0"/>
+        <RemoveFolder Id="NexusLinkMenu" On="uninstall"/>
+        <RegistryValue Root="HKCU" Key="Software\NexusLink" Name="shortcut" Type="integer" Value="1" KeyPath="yes"/>
+      </Component>
+    </DirectoryRef>
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="5d6f7b8c-9e0a-4bd4-cf5a-6b7c8d9e0f1a">
+        <Shortcut Id="DesktopShortcut"
+                  Name="NexusLink"
+                  Description="NexusLink - local AI gateway"
+                  Target="[INSTALLDIR]nexuslink.exe"
+                  Arguments="app"
+                  WorkingDirectory="INSTALLDIR"
+                  Icon="AppIco"
+                  IconIndex="0"/>
+        <RemoveFolder Id="DesktopFolder" On="uninstall"/>
+        <RegistryValue Root="HKCU" Key="Software\NexusLink" Name="shortcut2" Type="integer" Value="1" KeyPath="yes"/>
+      </Component>
+    </DirectoryRef>
   </Fragment>
 </Wix>
