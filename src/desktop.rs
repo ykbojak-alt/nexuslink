@@ -14,13 +14,104 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::window::WindowBuilder;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon as TrayIcon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use wry::WebViewBuilder;
+use wry::{WebContext, WebViewBuilder};
 
 use crate::config::Config;
 use crate::proxy::state_from_config;
 
 const ICON_RGBA: &[u8] = include_bytes!("../assets/nexuslink.rgba");
 const ICON_SIZE: u32 = 64;
+const WINDOW_TITLE: &str = "NexusLink";
+
+/// Named mutex guarding `nexuslink app`. The first process creates the name;
+/// a later launch gets ERROR_ALREADY_EXISTS, restores the running panel and
+/// exits before spawning a second server or window.
+#[cfg(target_os = "windows")]
+mod single_instance {
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+
+    const MUTEX_NAME: &str = r"Local\NexusLink-single-instance";
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// Holds the mutex handle for the process lifetime; the name disappears
+    /// when the primary instance exits.
+    pub struct InstanceGuard(HANDLE);
+
+    impl Drop for InstanceGuard {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// Some(guard) — this is the first instance. None — another instance owns
+    /// the name; it should have been focused already.
+    pub fn acquire(name: &str) -> std::io::Result<Option<InstanceGuard>> {
+        let name_w = wide(name);
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name_w.as_ptr()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let last = unsafe { GetLastError() };
+        if last == ERROR_ALREADY_EXISTS {
+            unsafe { CloseHandle(handle) };
+            return Ok(None);
+        }
+        Ok(Some(InstanceGuard(handle)))
+    }
+
+    pub fn default_name() -> &'static str {
+        MUTEX_NAME
+    }
+
+    /// Bring the running panel back from the tray (or from minimized) and put
+    /// it in front. The first instance may still be starting, so wait briefly
+    /// for its window to appear.
+    pub fn focus_existing_window(title: &str) -> bool {
+        let title_w = wide(title);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let hwnd = unsafe { FindWindowW(std::ptr::null(), title_w.as_ptr()) };
+            if !hwnd.is_null() {
+                unsafe {
+                    ShowWindow(hwnd, SW_RESTORE);
+                    SetForegroundWindow(hwnd);
+                }
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod single_instance {
+    pub struct InstanceGuard;
+
+    pub fn acquire(_name: &str) -> std::io::Result<Option<InstanceGuard>> {
+        Ok(Some(InstanceGuard))
+    }
+
+    pub fn default_name() -> &'static str {
+        "nexuslink-single-instance"
+    }
+
+    pub fn focus_existing_window(_title: &str) -> bool {
+        false
+    }
+}
 
 enum UserEvent {
     Tray(TrayIconEvent),
@@ -276,6 +367,24 @@ fn wait_for_gateway(port: u16) -> bool {
 
 /// Entry for `nexuslink app`: background server + panel window + tray.
 pub fn run_app(cfg: Config) -> anyhow::Result<()> {
+    // Must run before the server thread: a second launch should never bind the
+    // port or build a window, only surface the one already running.
+    let _instance = match single_instance::acquire(single_instance::default_name()) {
+        Ok(Some(guard)) => Some(guard),
+        Ok(None) => {
+            tracing::info!("NexusLink is already running — focusing its window");
+            if !single_instance::focus_existing_window(WINDOW_TITLE) {
+                tracing::warn!("running NexusLink instance has no window yet — leaving it alone");
+            }
+            return Ok(());
+        }
+        Err(e) => {
+            // Fail open: a broken mutex must not keep the gateway from starting.
+            tracing::warn!("single-instance mutex unavailable ({e}) — continuing");
+            None
+        }
+    };
+
     let port = cfg.port;
     let token = cfg.incoming_token.clone();
 
@@ -309,7 +418,7 @@ pub fn run_app(cfg: Config) -> anyhow::Result<()> {
     let restored = WindowState::load().and_then(|st| st.on_screen(&monitors));
 
     let mut builder = WindowBuilder::new()
-        .with_title("NexusLink")
+        .with_title(WINDOW_TITLE)
         .with_decorations(false)
         .with_min_inner_size(tao::dpi::LogicalSize::new(760.0_f64, 520.0_f64))
         .with_window_icon(
@@ -326,7 +435,16 @@ pub fn run_app(cfg: Config) -> anyhow::Result<()> {
     dress_window(&window);
 
     let ipc_proxy = proxy.clone();
-    let builder = WebViewBuilder::new()
+    // WebView2 needs a writable user data folder. Without an explicit
+    // context wry falls back to the default UDF `<exe>.WebView2`, which
+    // lives inside Program Files on a normal MSI install → E_ACCESSDENIED
+    // → blank window (confirmed: NexusLink 0.2.0 MSI bug report).
+    let data_dir = crate::config::webview_data_dir();
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        tracing::error!("cannot create WebView2 data dir {} ({e})", data_dir.display());
+    }
+    let mut web_context = WebContext::new(Some(data_dir));
+    let builder = WebViewBuilder::new_with_web_context(&mut web_context)
         .with_url(&url)
         .with_initialization_script(TITLEBAR_JS)
         .with_hotkeys_zoom(false)
@@ -343,7 +461,10 @@ pub fn run_app(cfg: Config) -> anyhow::Result<()> {
     let webview = match hide_browser_chrome(builder).build(&window) {
         Ok(wv) => Some(wv),
         Err(e) => {
-            tracing::error!("WebView2 unavailable ({e}) — the gateway keeps running; install the WebView2 Runtime for the panel");
+            tracing::error!(
+                "WebView2 init failed ({e}) — gateway keeps running; \
+                 open the panel in a browser: {url}"
+            );
             None
         }
     };
@@ -527,5 +648,18 @@ mod tests {
                 maximized: false
             }
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn second_launch_sees_the_instance_mutex() {
+        let name = format!(r"Local\NexusLink-test-{}", std::process::id());
+        let first = single_instance::acquire(&name).expect("create mutex");
+        assert!(first.is_some(), "first launch owns the name");
+        let second = single_instance::acquire(&name).expect("open existing mutex");
+        assert!(second.is_none(), "second launch must not become primary");
+        drop(first);
+        let third = single_instance::acquire(&name).expect("recreate mutex");
+        assert!(third.is_some(), "name is free again after the owner exits");
     }
 }

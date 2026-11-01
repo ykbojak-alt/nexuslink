@@ -3,10 +3,10 @@
 
 use axum::{
     body::Body,
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    extract::{Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     response::{IntoResponse, Json, Response},
-    routing::{get, post},
+    routing::{any, get, post},
     Router,
 };
 use bytes::Bytes;
@@ -16,9 +16,11 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 use crate::config::{
-    flat_slots, resolve_candidates, Config, Resolved, HEARTBEAT_SECS, MAX_BODY, MAX_RECTIFY,
+    flat_slots, is_agent_alias, resolve_candidates, Config, NUEKeyStore, NUEUpstream, Resolved,
+    SchedulingMode, AGENT_ALIASES,
+    HEARTBEAT_SECS, MAX_RECTIFY,
 };
-use crate::rotation::{self, Blacklist, RotateReason, Verdict};
+use crate::rotation::{self, ActiveLoadGuard, Blacklist, RotateReason, Verdict};
 use crate::streaming::StreamConverter;
 use crate::translator::{anthropic_to_openai, openai_to_anthropic, MessagesRequest};
 
@@ -28,13 +30,15 @@ pub struct AppState {
     /// Rotation memory: recently-failed keys/models, shared with the UI
     /// status endpoint so the panel can show what is currently parked.
     pub blacklist: Blacklist,
-    /// Round-robin cursor per slot: each request starts at the next
-    /// candidate after the previous winner, so free-tier RPM quota is
-    /// spread across the key pool instead of always burning key #1.
+    /// Candidate cursor per slot, used by models configured as balanced.
     pub cursor: RwLock<HashMap<String, usize>>,
     /// Per-candidate attempt stats (ok/fail/latency), surfaced via /api/status.
     pub metrics: crate::metrics::Metrics,
     pub started: std::time::Instant,
+    /// NUE client key store (persisted alongside config).
+    pub nue_keys: RwLock<NUEKeyStore>,
+    /// NUE upstream config (ai2 host).
+    pub nue_upstream: RwLock<NUEUpstream>,
 }
 
 /// Shared state for the `serve` command and the desktop shell: the same
@@ -42,6 +46,8 @@ pub struct AppState {
 /// WebView2 window.
 pub fn state_from_config(mut cfg: Config) -> Arc<AppState> {
     crate::config::normalize_slots(&mut cfg);
+    let nue_keys = NUEKeyStore::load();
+    let nue_upstream = cfg.nue_upstream.clone();
     Arc::new(AppState {
         config: RwLock::new(cfg),
         client: reqwest::Client::builder()
@@ -53,16 +59,184 @@ pub fn state_from_config(mut cfg: Config) -> Arc<AppState> {
         cursor: RwLock::new(HashMap::new()),
         metrics: crate::metrics::Metrics::new(),
         started: std::time::Instant::now(),
+        nue_keys: RwLock::new(nue_keys),
+        nue_upstream: RwLock::new(nue_upstream),
     })
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .allow_credentials(false)
+        .expose_headers([header::CONTENT_TYPE]);
+
     Router::new()
         .route("/v1/models", get(models))
         .route("/v1/messages", post(messages))
         .route("/health", get(|| async { "ok" }))
         .merge(crate::ui::router())
+        .layer(cors)
         .with_state(state)
+}
+
+/// NUE passthrough gateway — served on `config.nue_port`, a separate
+/// listener from the Anthropic gateway so `/v1/*` paths mean the upstream
+/// host's API here (not our slot API). NUE clients authenticate with
+/// nue_* client keys; the gateway swaps them for the upstream AI-2 key —
+/// the upstream secret never leaves this process.
+pub fn nue_router(state: Arc<AppState>) -> Router {
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods([Method::GET, Method::POST, Method::PUT,
+                        Method::DELETE, Method::PATCH, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE,
+                        header::HeaderName::from_static("x-register-token")])
+        .allow_credentials(false)
+        .expose_headers([header::CONTENT_TYPE]);
+
+    Router::new()
+        .route("/nue/register", post(nue_register))
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/v1/{*path}", any(nue_passthrough))
+        .layer(cors)
+        .with_state(state)
+}
+
+fn nue_gen_key() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static CTR: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mix = nanos
+        ^ ((std::process::id() as u128) << 64)
+        ^ ((CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128) << 32);
+    format!("nue_{mix:032x}")
+}
+
+/// POST /nue/register — issues a nue_* client key, persists it in the
+/// key store, returns {"key": ...}. Guarded by config.nue_register_token
+/// when set (X-Register-Token header); empty token = open registration.
+async fn nue_register(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    let want = state.config.read().unwrap().nue_register_token.clone();
+    if !want.is_empty() {
+        let got = headers
+            .get("x-register-token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if got != want {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "invalid register token" })),
+            )
+                .into_response();
+        }
+    }
+    let key = nue_gen_key();
+    let save_err = {
+        let mut ks = state.nue_keys.write().unwrap();
+        ks.add_key(key.clone());
+        ks.save().err()
+    };
+    if let Some(e) = save_err {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("persist key: {e}") })),
+        )
+            .into_response();
+    }
+    (StatusCode::OK, Json(json!({ "key": key }))).into_response()
+}
+
+/// Prefixes that must never transit the client surface — key management
+/// and management/destructive routes stay operator-side even though the
+/// upstream key's own scopes would also refuse them.
+const NUE_DENY_PREFIXES: &[&str] = &["/v1/keys", "/_bus", "/v1/startup"];
+
+/// ANY /v1/{*path} — validate the nue_* client key, swap Bearer for the
+/// configured upstream key, stream the upstream response back (covers
+/// both JSON and SSE without buffering).
+async fn nue_passthrough(
+    State(state): State<Arc<AppState>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let key = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|a| a.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if !state.nue_keys.read().unwrap().validate(key) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid or missing nue_* client key" })),
+        )
+            .into_response();
+    }
+    let path = uri.path();
+    if !path.starts_with("/v1/")
+        || NUE_DENY_PREFIXES.iter().any(|p| path.starts_with(p))
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "not found" })),
+        )
+            .into_response();
+    }
+    let up = state.nue_upstream.read().unwrap().clone();
+    if up.base_url.trim().is_empty() || up.api_key.trim().is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "nue upstream not configured" })),
+        )
+            .into_response();
+    }
+    let base = up.base_url.trim_end_matches('/');
+    let url = match uri.query() {
+        Some(q) => format!("{base}{path}?{q}"),
+        None => format!("{base}{path}"),
+    };
+    let mut req = state
+        .client
+        .request(method, url)
+        .bearer_auth(up.api_key.trim())
+        .body(body);
+    if let Some(ct) = headers.get(header::CONTENT_TYPE) {
+        req = req.header(header::CONTENT_TYPE, ct);
+    }
+    match req.send().await {
+        Ok(resp) => {
+            let status = StatusCode::from_u16(resp.status().as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let ct = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let mut r = Response::new(Body::from_stream(resp.bytes_stream()));
+            *r.status_mut() = status;
+            if let Some(ct) = ct {
+                if let Ok(v) = HeaderValue::from_str(&ct) {
+                    r.headers_mut().insert(header::CONTENT_TYPE, v);
+                }
+            }
+            r
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("upstream: {e}") })),
+        )
+            .into_response(),
+    }
 }
 
 fn anthropic_error(status: StatusCode, etype: &str, msg: &str) -> Response {
@@ -109,19 +283,46 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     if !check_auth(&headers, &config.incoming_token) {
         return anthropic_error(StatusCode::UNAUTHORIZED, "authentication_error", "invalid api key");
     }
-    let data: Vec<Value> = flat_slots(&config)
+    let mut data: Vec<Value> = flat_slots(&config)
         .into_iter()
         .map(|(slot, name)| json!({ "id": slot, "display_name": name, "created": 0 }))
         .collect();
+    for (alias, persona) in AGENT_ALIASES {
+        if !resolve_candidates(alias, &config).is_empty() {
+            data.push(json!({
+                "id": alias,
+                "display_name": format!("{persona} ranked model pool"),
+                "created": 0,
+            }));
+        }
+    }
     Json(json!({ "data": data })).into_response()
 }
 
 /// POST /v1/messages — the whole point of the program.
-async fn messages(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    if body.len() > MAX_BODY {
-        return anthropic_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", "body too large");
-    }
+async fn messages(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    let (parts, request_body) = request.into_parts();
+    let headers = parts.headers;
     let config = state.config.read().unwrap().clone();
+    let mut request_body = request_body.into_data_stream();
+    let mut body_bytes = Vec::new();
+    while let Some(chunk) = futures_util::StreamExt::next(&mut request_body).await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                return anthropic_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "failed to read request body",
+                )
+            }
+        };
+        if body_bytes.len().saturating_add(chunk.len()) > config.max_body_bytes {
+            return anthropic_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", "body too large");
+        }
+        body_bytes.extend_from_slice(&chunk);
+    }
+    let body = Bytes::from(body_bytes);
     if !check_auth(&headers, &config.incoming_token) {
         return anthropic_error(StatusCode::UNAUTHORIZED, "authentication_error", "invalid api key");
     }
@@ -138,7 +339,19 @@ async fn messages(State(state): State<Arc<AppState>>, headers: HeaderMap, body: 
     };
 
     let slot = req.model.clone();
-    let candidates = resolve_candidates(&slot, &config);
+    let mut candidates = resolve_candidates(&slot, &config);
+    if candidates.is_empty() && !config.fallback_slot.is_empty() {
+        // Unmapped slot (e.g. Claude Code background haiku/sonnet traffic):
+        // serve it from the configured fallback slot's pool instead of
+        // hard-failing — the operator opted into this in config.json.
+        candidates = resolve_candidates(&config.fallback_slot, &config);
+        if !candidates.is_empty() {
+            tracing::info!(
+                slot = %slot, fallback = %config.fallback_slot,
+                "unmapped slot routed via fallback_slot"
+            );
+        }
+    }
     if candidates.is_empty() {
         return anthropic_error(
             StatusCode::BAD_REQUEST,
@@ -148,28 +361,43 @@ async fn messages(State(state): State<Arc<AppState>>, headers: HeaderMap, body: 
     }
     let is_stream = req.stream.unwrap_or(false);
 
-    // Rotation: walk every (provider, model, key) candidate in config order.
-    // Auth/quota/endpoint failures blacklist the key and move the pointer;
+    // Failover is provider-priority first; balanced prefers the least-loaded
+    // provider. Within either mode, least-loaded keys go first and active
+    // Retry-After cooldowns are excluded.
     // 400-class request errors are returned verbatim — every provider would
     // reject the same body, so rotating them just multiplies the failure.
     let n = candidates.len();
-    let start = {
+    let mode = if is_agent_alias(&slot) {
+        // Persona aliases have a benchmark-ranked model chain. Balanced mode
+        // may spread load within each model/provider tier, but must not move a
+        // lower-ranked tier ahead of the primary.
+        SchedulingMode::Failover
+    } else {
+        candidates[0].scheduling_mode
+    };
+    let cursor = {
         let cursors = state.cursor.read().unwrap();
         cursors.get(&slot).copied().unwrap_or(0) % n
     };
-    let mut skipped = 0usize;
+    let (order, mut first_load) = state.blacklist.active_loads.order_and_acquire(
+        &slot,
+        |loads| candidate_order(&candidates, cursor, mode, &state.blacklist, loads),
+    );
+    let mut skipped = candidates.len().saturating_sub(order.len());
     let mut failed: Vec<String> = Vec::new();
     let mut last_error: Option<Response> = None;
-    for i in 0..n {
-        let cand = &candidates[(start + i) % n];
-        if cand.url.is_empty() {
-            continue;
-        }
+    for candidate_index in order {
+        let cand = &candidates[candidate_index];
+        let load_guard = first_load.take().unwrap_or_else(|| {
+            state.blacklist.active_loads.acquire(&slot, candidate_index)
+        });
         if state
             .blacklist
             .is_blocked(&cand.base_url, &cand.model, &cand.api_key)
+            || state.blacklist.key_bench_remaining(&cand.base_url, &cand.api_key).is_some()
         {
             skipped += 1;
+            drop(load_guard);
             continue;
         }
         let t0 = std::time::Instant::now();
@@ -178,26 +406,32 @@ async fn messages(State(state): State<Arc<AppState>>, headers: HeaderMap, body: 
                 state.metrics.record(&cand.provider, &cand.model, &cand.api_key,
                                      true, t0.elapsed().as_millis() as u64, "");
                 let model = cand.model.clone();
-                // Next request starts at the candidate after this winner.
+                // Advance a monotonic per-slot cursor. Failover uses it only
+                // to rotate keys within the primary provider; balanced uses
+                // it for both provider affinity and key-pool rotation.
                 state
                     .cursor
                     .write()
                     .unwrap()
-                    .insert(slot.clone(), (start + i + 1) % n);
+                    .insert(slot.clone(), cursor.wrapping_add(1));
                 return if is_stream {
-                    bridge_stream(resp, &model, &slot)
+                    bridge_stream(resp, &model, &slot, load_guard)
                 } else {
-                    translate_body(resp, &slot).await
+                    let translated = translate_body(resp, &slot).await;
+                    drop(load_guard);
+                    translated
                 };
             }
-            Attempt::Rotate(reason, note) => {
+            Attempt::Rotate(reason, note, cooldown) => {
                 state.metrics.record(&cand.provider, &cand.model, &cand.api_key,
                                      false, t0.elapsed().as_millis() as u64, &note);
                 match reason {
                     RotateReason::Key => {
-                        state
-                            .blacklist
-                            .block_key(&cand.base_url, &cand.api_key, &note)
+                        if let Some(duration) = cooldown {
+                            state.blacklist.bench_key(&cand.base_url, &cand.api_key, duration)
+                        } else {
+                            state.blacklist.block_key(&cand.base_url, &cand.api_key, &note)
+                        }
                     }
                     RotateReason::Model => {
                         state
@@ -206,6 +440,7 @@ async fn messages(State(state): State<Arc<AppState>>, headers: HeaderMap, body: 
                     }
                     RotateReason::Transient => {}
                 }
+                drop(load_guard);
                 tracing::info!(
                     slot = %slot, provider = %cand.provider, model = %cand.model,
                     key = %rotation::key_tag(&cand.api_key),
@@ -215,6 +450,7 @@ async fn messages(State(state): State<Arc<AppState>>, headers: HeaderMap, body: 
                     cand.provider, cand.model, rotation::key_tag(&cand.api_key)));
             }
             Attempt::Return(resp) => {
+                drop(load_guard);
                 state.metrics.record(&cand.provider, &cand.model, &cand.api_key,
                                      false, t0.elapsed().as_millis() as u64,
                                      &format!("upstream HTTP {}", resp.status().as_u16()));
@@ -227,8 +463,41 @@ async fn messages(State(state): State<Arc<AppState>>, headers: HeaderMap, body: 
     if let Some(resp) = last_error {
         return resp;
     }
+    // Every candidate is now blocked or cooling down — whether the limits
+    // hit during this request or the keys were already parked. When the
+    // soonest bench expiry is known the honest answer is 429 + Retry-After:
+    // the client backs off instead of hammering 502s (which is what
+    // produced the reconnect storm during slot starvation).
+    {
+        let soonest = candidates
+            .iter()
+            .filter_map(|c| {
+                state
+                    .blacklist
+                    .key_bench_remaining(&c.base_url, &c.api_key)
+            })
+            .min();
+        if let Some(remaining) = soonest {
+            let secs = remaining.as_secs().max(1);
+            let mut resp = anthropic_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                &format!(
+                    "nexuslink: all {} candidate(s) for {slot} are cooling down \
+                     after upstream rate limits — retry in {secs}s",
+                    skipped + failed.len()
+                ),
+            );
+            resp.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_str(&secs.to_string())
+                    .unwrap_or_else(|_| HeaderValue::from_static("60")),
+            );
+            return resp;
+        }
+    }
     let detail = if failed.is_empty() {
-        format!("{skipped} candidate(s) are currently blacklisted")
+        format!("{skipped} candidate(s) are unavailable (blacklisted or cooling down)")
     } else {
         format!("{} attempt(s) failed — {}", failed.len(), failed.join(" | "))
     };
@@ -239,12 +508,151 @@ async fn messages(State(state): State<Arc<AppState>>, headers: HeaderMap, body: 
     )
 }
 
+fn candidate_order(
+    candidates: &[Resolved],
+    cursor: usize,
+    mode: SchedulingMode,
+    blacklist: &Blacklist,
+    loads: &HashMap<usize, usize>,
+) -> Vec<usize> {
+    let n = candidates.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for index in 0..n {
+        let candidate = &candidates[index];
+        if candidate.url.is_empty()
+            || blacklist.is_blocked(&candidate.base_url, &candidate.model, &candidate.api_key)
+            || blacklist.key_bench_remaining(&candidate.base_url, &candidate.api_key).is_some()
+        {
+            continue;
+        }
+        let same_provider = groups.last().and_then(|group| group.first()).is_some_and(|first| {
+            candidates[*first].provider == candidate.provider
+                && candidates[*first].base_url == candidate.base_url
+                && candidates[*first].route_priority == candidate.route_priority
+        });
+        if same_provider {
+            groups.last_mut().unwrap().push(index);
+        } else {
+            groups.push(vec![index]);
+        }
+    }
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let first_group = match mode {
+        SchedulingMode::Failover => 0,
+        SchedulingMode::Balanced => cursor % groups.len(),
+    };
+    let mut ordered_groups = Vec::with_capacity(groups.len());
+    for offset in 0..groups.len() {
+        let group = &groups[(first_group + offset) % groups.len()];
+        let key_start = cursor % group.len();
+        let mut keys: Vec<usize> = (0..group.len())
+            .map(|key_offset| group[(key_start + key_offset) % group.len()])
+            .collect();
+        // Stable sorting keeps cursor rotation as the tie-breaker while
+        // preferring the key with the fewest active requests.
+        keys.sort_by_key(|index| loads.get(index).copied().unwrap_or(0));
+        ordered_groups.push(keys);
+    }
+    if mode == SchedulingMode::Balanced {
+        // Prefer the provider with the least active candidate load; the
+        // cursor-rotated order breaks ties.
+        ordered_groups.sort_by_key(|group| {
+            group.iter().map(|index| loads.get(index).copied().unwrap_or(0)).sum::<usize>()
+        });
+    }
+    ordered_groups.into_iter().flatten().collect()
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+    use crate::config::SchedulingMode;
+    use std::time::Duration;
+
+    fn candidate(provider: &str, key: &str) -> Resolved {
+        Resolved {
+            model: "model".into(),
+            url: "https://example.test/v1/chat/completions".into(),
+            base_url: "https://example.test".into(),
+            api_key: key.into(),
+            provider: provider.into(),
+            supports_reasoning_effort: false,
+            use_max_completion_tokens: true,
+            context: 0,
+            auto_compact: true,
+            scheduling_mode: SchedulingMode::Failover,
+            route_priority: 0,
+        }
+    }
+
+    #[test]
+    fn failover_starts_primary_balanced_rotates_from_cursor_and_excludes_benched_keys() {
+        let mut candidates = vec![candidate("primary", "a"), candidate("primary", "b"), candidate("backup", "c")];
+        let blacklist = Blacklist::new();
+        let loads = HashMap::new();
+        assert_eq!(candidate_order(&candidates, 2, SchedulingMode::Failover, &blacklist, &loads), vec![0, 1, 2]);
+        assert_eq!(candidate_order(&candidates, 1, SchedulingMode::Balanced, &blacklist, &loads), vec![2, 1, 0]);
+
+        blacklist.bench_key(&candidates[0].base_url, "a", Duration::from_secs(60));
+        assert_eq!(candidate_order(&candidates, 0, SchedulingMode::Failover, &blacklist, &loads), vec![1, 2]);
+        candidates[1].api_key.clear();
+        assert_eq!(candidate_order(&candidates, 0, SchedulingMode::Failover, &Blacklist::new(), &loads), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn balanced_spreads_provider_starts_even_when_key_pool_sizes_differ() {
+        let candidates = vec![candidate("primary", "a"), candidate("primary", "b"), candidate("backup", "c")];
+        let blacklist = Blacklist::new();
+        let loads = HashMap::new();
+        let first = candidate_order(&candidates, 0, SchedulingMode::Balanced, &blacklist, &loads);
+        let second = candidate_order(&candidates, 1, SchedulingMode::Balanced, &blacklist, &loads);
+        let third = candidate_order(&candidates, 2, SchedulingMode::Balanced, &blacklist, &loads);
+        assert_eq!([first[0], second[0], third[0]], [0, 2, 0]);
+        assert_eq!(candidate_order(&candidates, 1, SchedulingMode::Failover, &blacklist, &loads)[0], 1);
+    }
+
+    #[test]
+    fn failover_chooses_least_loaded_key_within_primary_provider() {
+        let candidates = vec![candidate("primary", "a"), candidate("primary", "b"), candidate("backup", "c")];
+        let blacklist = Blacklist::new();
+        let loads = crate::rotation::ActiveLoads::new();
+        let (order, active) = loads.order_and_acquire("slot", |counts| {
+            candidate_order(&candidates, 0, SchedulingMode::Failover, &blacklist, counts)
+        });
+
+        assert_eq!(order, vec![0, 1, 2]);
+        let active = active.unwrap();
+        let (next_order, next_active) = loads.order_and_acquire("slot", |counts| {
+            candidate_order(&candidates, 0, SchedulingMode::Failover, &blacklist, counts)
+        });
+        assert_eq!(next_order, vec![1, 0, 2]);
+        drop(next_active);
+        drop(active);
+        assert_eq!(loads.load("slot", 0), 0);
+    }
+
+    #[test]
+    fn balanced_prefers_provider_with_lower_active_candidate_load() {
+        let candidates = vec![candidate("primary", "a"), candidate("backup", "b")];
+        let blacklist = Blacklist::new();
+        let loads = HashMap::from([(0, 1)]);
+        assert_eq!(candidate_order(&candidates, 0, SchedulingMode::Balanced, &blacklist, &loads), vec![1, 0]);
+        let loads = HashMap::new();
+        assert_eq!(candidate_order(&candidates, 0, SchedulingMode::Balanced, &blacklist, &loads), vec![0, 1]);
+    }
+}
+
 /// One (provider, model, key) attempt including the 4xx rectifier loop.
 enum Attempt {
     /// Upstream answered 2xx — stream or translate.
     Success(reqwest::Response),
     /// Move to the next candidate; the note lands in the log and status.
-    Rotate(RotateReason, String),
+    Rotate(RotateReason, String, Option<std::time::Duration>),
     /// Hand this response to the client — rotating can't fix it.
     Return(Response),
 }
@@ -278,6 +686,7 @@ async fn try_candidate(
                 return Attempt::Rotate(
                     RotateReason::Transient,
                     format!("unreachable: {e}"),
+                    None,
                 )
             }
         };
@@ -285,6 +694,14 @@ async fn try_candidate(
         if (200..300).contains(&status) {
             return Attempt::Success(resp);
         }
+        let retry_after = if status == StatusCode::TOO_MANY_REQUESTS.as_u16() {
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        } else {
+            None
+        };
         // Read the body once — every non-2xx branch needs it (classify,
         // context-overflow sniff, rectify, or the verbatim return).
         let body = resp.bytes().await.unwrap_or_default();
@@ -295,12 +712,20 @@ async fn try_candidate(
             return Attempt::Rotate(
                 RotateReason::Transient,
                 format!("HTTP {status} context length exceeded — {}", upstream_message(&body)),
+                    None,
             );
         }
         match rotation::classify(status) {
             Verdict::Rotate(reason) => {
                 let note = upstream_message(&body);
-                return Attempt::Rotate(reason, format!("HTTP {status} {note}"));
+                let cooldown = (status == StatusCode::TOO_MANY_REQUESTS.as_u16()).then(|| {
+                    rotation::retry_after(
+                        retry_after.as_deref(),
+                        std::time::SystemTime::now(),
+                        rotation::BLACKLIST_TTL,
+                    )
+                });
+                return Attempt::Rotate(reason, format!("HTTP {status} {note}"), cooldown);
             }
             Verdict::Return => {
                 // 4xx request errors: the rectifiers may still rescue it by
@@ -540,20 +965,33 @@ fn rectify(body: &Value, status: u16, err: &[u8]) -> Option<Value> {
 // SSE bridge: upstream OpenAI stream -> translated Anthropic stream
 // ---------------------------------------------------------------------------
 
-fn bridge_stream(resp: reqwest::Response, upstream_model: &str, slot: &str) -> Response {
+fn bridge_stream(
+    resp: reqwest::Response,
+    upstream_model: &str,
+    slot: &str,
+    load_guard: ActiveLoadGuard,
+) -> Response {
     let converter_model = slot.to_string();
     let byte_stream = resp.bytes_stream();
 
     // Parse upstream SSE -> translate each data payload -> re-emit frames.
     // heartbeat: idle > HEARTBEAT_SECS inserts an SSE comment line.
     let out_stream = async_stream_bridge(byte_stream, upstream_model.to_string(), converter_model);
+    let guarded_stream = futures_util::stream::unfold(
+        (Box::pin(out_stream), load_guard),
+        |(mut stream, guard)| async move {
+            futures_util::StreamExt::next(&mut stream)
+                .await
+                .map(|item| (item, (stream, guard)))
+        },
+    );
 
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
         .header("connection", "keep-alive")
-        .body(Body::from_stream(out_stream))
+        .body(Body::from_stream(guarded_stream))
         .unwrap()
         .into_response()
 }

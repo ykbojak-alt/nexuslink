@@ -3,6 +3,7 @@
 //! and integration tests.
 
 pub mod config;
+#[cfg(windows)]
 pub mod desktop;
 pub mod gateway;
 pub mod mcp;

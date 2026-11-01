@@ -64,10 +64,20 @@ async fn main() {
         )
         .init();
 
-    let cmd = std::env::args().nth(1).unwrap_or_else(|| "serve".into());
+    let command = match parse_command(std::env::args().nth(1).as_deref()) {
+        Ok(command) => command,
+        Err(cmd) => {
+            eprintln!("unknown command: {cmd}");
+            eprint!("{USAGE}");
+            std::process::exit(2);
+        }
+    };
 
-    match cmd.as_str() {
-        "init" => {
+    match command {
+        CliCommand::Help => println!("{USAGE}"),
+        CliCommand::Version => println!("nexuslink {}", env!("CARGO_PKG_VERSION")),
+        CliCommand::Serve(open_ui) => serve(open_ui).await,
+        CliCommand::Init => {
             let path = config::config_path();
             if path.exists() {
                 println!("config already exists: {}", path.display());
@@ -78,13 +88,13 @@ async fn main() {
                 println!("incoming_token = {}", cfg.incoming_token);
             }
         }
-        "slots" => {
+        CliCommand::Slots => {
             let cfg = config::load();
             for (slot, name) in config::flat_slots(&cfg) {
                 println!("{slot} -> {name}");
             }
         }
-        "apply" => {
+        CliCommand::Apply => {
             let cfg = config::load();
             match gateway::apply_to_claude_desktop(&cfg) {
                 Ok(msg) => println!("{msg}\nrestart Claude Desktop to pick it up"),
@@ -94,24 +104,75 @@ async fn main() {
                 }
             }
         }
-        "mcp" => {
+        CliCommand::Mcp => {
             let cfg = config::load();
             if let Err(e) = nexuslink::mcp::run(cfg) {
                 eprintln!("mcp server failed: {e:#}");
                 std::process::exit(1);
             }
         }
-        "app" => {
-            let cfg = config::load();
+        CliCommand::App => {
+            let cfg = load_or_scaffold();
             warn_empty_token(&cfg);
-            if let Err(e) = nexuslink::desktop::run_app(cfg) {
-                eprintln!("desktop app failed: {e:#}");
-                std::process::exit(1);
+            #[cfg(windows)]
+            {
+                if let Err(e) = nexuslink::desktop::run_app(cfg) {
+                    eprintln!("desktop app failed: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = cfg;
+                eprintln!("`app` (desktop shell) is Windows-only; use `serve` on this platform");
+                std::process::exit(2);
             }
         }
-        _ => {
-            serve(cmd.as_str() == "ui").await;
-        }
+    }
+}
+
+const USAGE: &str = "Usage: nexuslink [COMMAND]\n\
+\n\
+Commands:\n\
+  serve       Run the local gateway (default)\n\
+  init        Create the starter config\n\
+  slots       Print slot-to-model mappings\n\
+  apply       Configure Claude Desktop to use this gateway\n\
+  mcp         Run the stdio MCP server\n\
+  app         Run the Windows desktop shell\n\
+  ui          Run the gateway and open its panel\n\
+\n\
+Options:\n\
+  -h, --help      Print this help\n\
+  -V, --version   Print version\n\
+\n\
+Config keys: port, nue_port, incoming_token, providers, nue_upstream,\n\
+nue_register_token (config.json)\n";
+
+#[derive(Debug, PartialEq, Eq)]
+enum CliCommand {
+    Help,
+    Version,
+    Serve(bool),
+    Init,
+    Slots,
+    Apply,
+    Mcp,
+    App,
+}
+
+fn parse_command(arg: Option<&str>) -> Result<CliCommand, &str> {
+    match arg {
+        None | Some("serve") => Ok(CliCommand::Serve(false)),
+        Some("ui") => Ok(CliCommand::Serve(true)),
+        Some("help" | "--help" | "-h") => Ok(CliCommand::Help),
+        Some("version" | "--version" | "-V") => Ok(CliCommand::Version),
+        Some("init") => Ok(CliCommand::Init),
+        Some("slots") => Ok(CliCommand::Slots),
+        Some("apply") => Ok(CliCommand::Apply),
+        Some("mcp") => Ok(CliCommand::Mcp),
+        Some("app") => Ok(CliCommand::App),
+        Some(other) => Err(other),
     }
 }
 
@@ -122,15 +183,33 @@ fn warn_empty_token(cfg: &config::Config) {
     }
 }
 
+/// MSI first-run: there is no config.json yet, so `load()` returns an
+/// empty-token default that rejects every request and locks the panel's
+/// token gate with no file to read the token from. Scaffold + save the
+/// starter config instead — same thing `nexuslink init` does.
+fn load_or_scaffold() -> config::Config {
+    if !config::config_path().exists() {
+        let cfg = config::scaffold();
+        if let Err(e) = config::save(&cfg) {
+            eprintln!("warning: cannot create config.json ({e}) — running with defaults");
+        } else {
+            eprintln!("created starter config: {}", config::config_path().display());
+        }
+        return cfg;
+    }
+    config::load()
+}
+
 async fn serve(open_ui: bool) {
-    let cfg = config::load();
+    let cfg = load_or_scaffold();
     warn_empty_token(&cfg);
     let port = cfg.port;
+    let nue_port = cfg.nue_port;
     let token = cfg.incoming_token.clone();
 
     let state = proxy::state_from_config(cfg);
 
-    let app = proxy::router(state);
+    let app = proxy::router(state.clone());
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
         Ok(l) => l,
         Err(e) => {
@@ -140,6 +219,24 @@ async fn serve(open_ui: bool) {
     };
     let url = format!("http://127.0.0.1:{port}/");
     tracing::info!("NexusLink listening on {url} — panel at {url}, API at {url}v1/");
+    if nue_port != port {
+        let nue_app = proxy::nue_router(state);
+        match tokio::net::TcpListener::bind(("127.0.0.1", nue_port)).await {
+            Ok(l) => {
+                tracing::info!("NUE passthrough on 127.0.0.1:{nue_port} — register at /nue/register, api at /v1/");
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(l, nue_app).await {
+                        tracing::error!("nue gateway died: {e}");
+                    }
+                });
+            }
+            Err(e) => {
+                eprintln!("warning: cannot bind NUE port {nue_port}: {e}");
+            }
+        }
+    } else {
+        eprintln!("warning: nue_port == port — NUE gateway disabled (set nue_port != {port})");
+    }
     if open_ui {
         // The panel token travels in the URL fragment: fragments never
         // leave the browser, so the secret skips logs, history and wire.
@@ -151,6 +248,32 @@ async fn serve(open_ui: bool) {
         open_browser(&ui_url);
     }
     axum::serve(listener, app).await.expect("server error");
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{parse_command, CliCommand};
+
+    #[test]
+    fn no_argument_keeps_default_serve() {
+        assert_eq!(parse_command(None), Ok(CliCommand::Serve(false)));
+    }
+
+    #[test]
+    fn help_and_version_aliases_are_recognized() {
+        for arg in ["help", "--help", "-h"] {
+            assert_eq!(parse_command(Some(arg)), Ok(CliCommand::Help));
+        }
+        for arg in ["version", "--version", "-V"] {
+            assert_eq!(parse_command(Some(arg)), Ok(CliCommand::Version));
+        }
+    }
+
+    #[test]
+    fn unknown_arguments_are_rejected_instead_of_serving() {
+        assert_eq!(parse_command(Some("--unknown")), Err("--unknown"));
+        assert_eq!(parse_command(Some("nonsense")), Err("nonsense"));
+    }
 }
 
 /// Best-effort browser open; failure is silent — the URL is in the log.

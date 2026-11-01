@@ -133,12 +133,49 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
                     "last_ms": last_ms, "note": last_note, "age_s": age_s })
         })
         .collect();
+    // Per-slot availability: how many candidates can serve a request right
+    // now vs benched (429 cooldown) vs blocked (auth/quota). `exhausted`
+    // flags the starvation state where nothing can serve — the condition
+    // that made agent sessions stall invisibly before this was surfaced.
+    let slot_health: Vec<Value> = slots
+        .iter()
+        .map(|(slot, _)| {
+            let cands = crate::config::resolve_candidates(slot, &config);
+            let mut ready = 0usize;
+            let mut benched = 0usize;
+            let mut blocked = 0usize;
+            let mut next_ready_in_s: Option<u64> = None;
+            for c in &cands {
+                if state.blacklist.is_blocked(&c.base_url, &c.model, &c.api_key) {
+                    blocked += 1;
+                } else if let Some(rem) =
+                    state.blacklist.key_bench_remaining(&c.base_url, &c.api_key)
+                {
+                    benched += 1;
+                    let secs = rem.as_secs().max(1);
+                    next_ready_in_s = Some(next_ready_in_s.map_or(secs, |n| n.min(secs)));
+                } else {
+                    ready += 1;
+                }
+            }
+            json!({
+                "slot": slot,
+                "candidates": cands.len(),
+                "ready": ready,
+                "benched": benched,
+                "blocked": blocked,
+                "next_ready_in_s": next_ready_in_s,
+                "exhausted": ready == 0,
+            })
+        })
+        .collect();
     Json(json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
         "port": config.port,
         "providers": config.providers.len(),
         "slots": slots.len(),
+        "slot_health": slot_health,
         "token_set": !config.incoming_token.is_empty(),
         "blacklist": blacklist,
         "metrics": metrics,

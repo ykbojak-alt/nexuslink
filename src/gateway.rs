@@ -167,6 +167,28 @@ pub fn apply_to_claude_desktop(config: &Config) -> Result<String, String> {
             }
         }
 
+        // Claude Code CLI (any terminal, incl. Herdr) takes auth from
+        // ANTHROPIC_* env; settings.json's env block applies over the parent
+        // process env, so this makes the bridge work without touching the
+        // user's registry env or restarting shells.
+        let p = home.join(".claude").join("settings.json");
+        let mut j = read_json(&p).unwrap_or(json!({}));
+        let mut changed = false;
+        for (k, v) in [
+            ("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{}", config.port)),
+            ("ANTHROPIC_AUTH_TOKEN", config.incoming_token.clone()),
+        ] {
+            if j.pointer(&format!("/env/{k}")).and_then(|x| x.as_str()) != Some(&v) {
+                j["env"][k] = json!(v);
+                changed = true;
+            }
+        }
+        if changed
+            && write_atomic(&p, &serde_json::to_string_pretty(&j).unwrap_or_default()).is_ok()
+        {
+            wrote.push(p.display().to_string());
+        }
+
         // Ship the video skill alongside the MCP registration so Claude Code
         // knows both the tool and the direct-API fallback playbook.
         let skill_dir = home.join(".claude").join("skills").join("nexuslink-video");

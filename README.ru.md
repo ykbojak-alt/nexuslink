@@ -152,6 +152,65 @@ claude-opus-4-6  claude-sonnet-4-6  claude-sonnet-4-5  claude-haiku-4-5
 туда ходят safety-проверки Auto-режима Claude). Назначение слотов **хранится**,
 не позиционное — добавление/удаление моделей не перетасовывает маппинги.
 
+## NUE-шлюз
+
+Отдельный NUE-listener — это слой авторизации между клиентом NEXUS и хостом
+AI-2. Клиентские ключи `nue_*` образуют отдельную цепочку; upstream API-ключ
+AI-2 остаётся в NexusLink и клиенту не раскрывается.
+
+**Поток запроса:** клиент один раз получает ключ регистрации, затем передаёт
+его как Bearer-токен на `/v1/*`. NexusLink заменяет его на настроенный Bearer-
+ключ upstream. Ответы, включая SSE, передаются потоком без буферизации;
+query-string сохраняется.
+
+| Поле конфига | Назначение |
+|---|---|
+| `nue_port` | Порт NUE-listener (по умолчанию `5680`), bind только на `127.0.0.1`. Если совпадает с `port`, NUE-шлюз отключается с предупреждением. |
+| `nue_upstream.base_url` | Базовый URL AI-2, например `https://ai2.example:4433`. |
+| `nue_upstream.api_key` | Scoped-ключ AI-2, который использует только шлюз для upstream-запросов. |
+| `nue_register_token` | Необязательный секрет регистрации. Если задан — нужен `X-Register-Token`; иначе регистрация открыта. |
+
+Ключи клиентов хранятся в `~/.nexuslink/nue_keys.json`, записываются атомарно
+и получают права `0600` на Unix. Они сохраняются после перезапуска.
+
+```bash
+NUE_BASE=http://127.0.0.1:5680
+
+# Открытая регистрация (nue_register_token пуст):
+curl -sS -X POST "$NUE_BASE/nue/register"
+
+# Если настроен секрет регистрации, используйте этот вариант:
+curl -sS -X POST "$NUE_BASE/nue/register" \
+  -H "X-Register-Token: $NUE_REGISTER_TOKEN"
+# {"key":"nue_<hex>"}
+
+# Сохраните возвращённое значение в NUE_KEY и используйте тело,
+# соответствующее API AI-2.
+curl -i -X POST "$NUE_BASE/v1/runs" \
+  -H "Authorization: Bearer $NUE_KEY" \
+  -H "Content-Type: application/json" \
+  --data-binary @run.json
+
+# SSE передаётся клиенту как есть:
+curl -N "$NUE_BASE/v1/runs/$RUN_ID/events" \
+  -H "Authorization: Bearer $NUE_KEY"
+```
+
+`401` означает отсутствующий/невалидный ключ клиента (или невалидный токен
+регистрации); `404` — запрещённый путь (`/v1/keys*`, `/_bus*`,
+`/v1/startup*`); `503` — не настроены upstream URL/ключ; `502` — upstream
+недоступен. Deny-list блокируется до запроса к upstream. Для браузерных
+клиентов CORS разрешает любой origin, методы `GET`, `POST`, `PUT`, `DELETE`,
+`PATCH`, `OPTIONS` и заголовки `Authorization` и `Content-Type`. Текущий CORS-
+allowlist не включает `X-Register-Token`: guarded-регистрацию из браузера с
+другого origin нужно выполнять через same-origin/server-side flow или сначала
+добавить этот заголовок в CORS allowlist.
+
+Основной Anthropic-шлюз на `127.0.0.1:5679` не меняется: NUE работает на
+втором listener, а не как маршрут этого порта. Оставляйте NUE-listener на
+loopback. Для удалённых клиентов поставьте перед ним TLS reverse proxy;
+используйте HTTPS в `nue_upstream.base_url`, если хост AI-2 находится в сети.
+
 ## Панель управления
 
 `nexuslink ui` открывает `http://127.0.0.1:<port>/#t=<token>` — токен едет во

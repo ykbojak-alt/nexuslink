@@ -149,6 +149,64 @@ New models get slots in preference order (`claude-sonnet-5` first — Claude's
 Auto mode safety checks go there). Slot assignments are **stored**, not
 positional, so adding/removing models never reshuffles existing mappings.
 
+## NUE gateway
+
+The separate NUE listener is an authentication wrapper between a NEXUS client
+and an AI-2 host. Client `nue_*` keys are a separate credential chain; the
+upstream AI-2 API key stays in NexusLink and is never exposed to the client.
+
+**Request flow:** register a client key once, send it as a Bearer token on
+`/v1/*`, and NexusLink replaces it with the configured upstream Bearer key.
+Responses are streamed without buffering, including SSE, and query strings are
+preserved.
+
+| Config field | Purpose |
+|---|---|
+| `nue_port` | NUE listener port (default `5680`); binds only to `127.0.0.1`. If it equals `port`, the NUE gateway is disabled with a warning. |
+| `nue_upstream.base_url` | AI-2 base URL, e.g. `https://ai2.example:4433`. |
+| `nue_upstream.api_key` | Scoped AI-2 key used only by the gateway for upstream requests. |
+| `nue_register_token` | Optional registration guard. If non-empty, registration requires `X-Register-Token`; otherwise registration is open. |
+
+Registered client keys are stored in `~/.nexuslink/nue_keys.json`, atomically
+written and restricted to mode `0600` on Unix. They survive restarts.
+
+```bash
+NUE_BASE=http://127.0.0.1:5680
+
+# Open registration (nue_register_token is empty):
+curl -sS -X POST "$NUE_BASE/nue/register"
+
+# If a registration guard is configured, use this instead:
+curl -sS -X POST "$NUE_BASE/nue/register" \
+  -H "X-Register-Token: $NUE_REGISTER_TOKEN"
+# {"key":"nue_<hex>"}
+
+# Save the returned value as NUE_KEY, then use a request body accepted by AI-2.
+curl -i -X POST "$NUE_BASE/v1/runs" \
+  -H "Authorization: Bearer $NUE_KEY" \
+  -H "Content-Type: application/json" \
+  --data-binary @run.json
+
+# SSE is passed through as received:
+curl -N "$NUE_BASE/v1/runs/$RUN_ID/events" \
+  -H "Authorization: Bearer $NUE_KEY"
+```
+
+The gateway returns `401` for a missing/invalid client key (or invalid
+registration token), `404` for denied paths (`/v1/keys*`, `/_bus*`,
+`/v1/startup*`), `503` when the upstream URL/key is not configured, and `502`
+when the upstream cannot be reached. The deny-list is rejected before any
+upstream request. CORS permits any origin, the `GET`, `POST`, `PUT`, `DELETE`,
+`PATCH`, and `OPTIONS` methods, and the `Authorization` and `Content-Type`
+headers. The current CORS allowlist does not include `X-Register-Token`, so a
+guarded cross-origin browser registration needs a CORS change or a
+same-origin/server-side registration flow.
+
+The main Anthropic gateway on `127.0.0.1:5679` is unchanged; NUE is a second
+listener, not a route on that port. Keep the NUE listener loopback-only. For
+remote clients, put a TLS reverse proxy in front of it; use HTTPS for
+`nue_upstream.base_url` whenever the AI-2 host is reached over a network.
+
 ## Management panel
 
 `nexuslink ui` opens `http://127.0.0.1:<port>/#t=<token>` — the token rides in

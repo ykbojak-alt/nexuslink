@@ -25,22 +25,59 @@ pub const SLOT_POOL: &[&str] = &[
     "claude-haiku-4-5",
 ];
 
+/// Public persona aliases use one shared, benchmark-ranked fallback pool.
+/// The order is intentionally primary-first and may be revised after the
+/// provider quota bench; only configured slots contribute candidates.
+pub const AGENT_ALIASES: &[(&str, &str)] = &[
+    ("agent/alice", "A.L.I.C.E."),
+    ("agent/forge", "F.O.R.G.E."),
+    ("agent/codex", "C.O.D.E.X."),
+    ("agent/ace", "A.C.E."),
+    ("agent/qoder", "Q.O.D.E.R."),
+];
+pub const AGENT_MODEL_POOL: &[&str] = &[
+    "claude-opus-4-8",
+    "claude-haiku-4-5",
+    "claude-sonnet-5",
+    "claude-opus-5",
+];
+
+pub fn is_agent_alias(model: &str) -> bool {
+    AGENT_ALIASES.iter().any(|(alias, _)| *alias == model)
+}
+
 pub const DEFAULT_PORT: u16 = 5679;
+/// Default port for NUE passthrough gateway (separate from main gateway).
+pub const DEFAULT_NUE_PORT: u16 = 5680;
 /// SSE keep-alive interval; well under Claude Desktop's ~5min dead-connection kill.
 pub const HEARTBEAT_SECS: u64 = 15;
-/// Request body cap.
-pub const MAX_BODY: usize = 10 * 1024 * 1024;
+/// Default request body cap (64 MiB).
+pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// Max per-request upstream retries after a rectifier rewrites the body.
 pub const MAX_RECTIFY: usize = 2;
 
 fn default_port() -> u16 {
     DEFAULT_PORT
 }
+fn default_nue_port() -> u16 {
+    DEFAULT_NUE_PORT
+}
+fn default_max_body_bytes() -> usize {
+    DEFAULT_MAX_BODY_BYTES
+}
 fn default_true() -> bool {
     true
 }
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SchedulingMode {
+    #[default]
+    Failover,
+    Balanced,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     /// Bearer token the client (Claude Desktop) must send to us.
     /// Phase-1 security fix: ModelLink had none; we reject anything else.
@@ -48,8 +85,46 @@ pub struct Config {
     pub incoming_token: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default = "default_nue_port")]
+    pub nue_port: u16,
     #[serde(default)]
     pub providers: Vec<Provider>,
+    /// NUE client keys (format: nue_<rand>). Validated on passthrough routes.
+    /// Loaded from keys store on startup; new keys added via /nue/register.
+    #[serde(default)]
+    pub nue_client_keys: Vec<String>,
+    /// Upstream AI-2 host for NUE passthrough (base_url + api_key from config, NOT from request).
+    #[serde(default)]
+    pub nue_upstream: NUEUpstream,
+    /// Optional token guarding POST /nue/register. Empty = open registration.
+    #[serde(default)]
+    pub nue_register_token: String,
+    /// Maximum accepted request body size, in bytes.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// Optional fallback: a request for a model slot nobody is mapped to
+    /// (e.g. Claude Code background traffic on `claude-haiku-*` while only
+    /// `claude-opus-4-8` is configured) is routed to this slot's candidates
+    /// instead of failing `400 unmapped slot`. Empty = strict mapping, the
+    /// historical behavior. Set a slot name like "claude-opus-4-8".
+    #[serde(default)]
+    pub fallback_slot: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            incoming_token: String::new(),
+            port: 0,
+            nue_port: 0,
+            providers: Vec::new(),
+            nue_client_keys: Vec::new(),
+            nue_upstream: NUEUpstream::default(),
+            nue_register_token: String::new(),
+            max_body_bytes: default_max_body_bytes(),
+            fallback_slot: String::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -104,6 +179,72 @@ pub struct ModelEntry {
     /// The model-catalog fetch in the panel prefills this when known.
     #[serde(default)]
     pub context: u64,
+    /// Candidate entry policy: primary-first by default, or round-robin across candidates.
+    #[serde(default)]
+    pub scheduling_mode: SchedulingMode,
+}
+
+/// Upstream AI-2 host for NUE passthrough.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct NUEUpstream {
+    /// Base URL of the AI-2 host (e.g., http://127.0.0.1:3124).
+    #[serde(default)]
+    pub base_url: String,
+    /// API key for the upstream AI-2 host (from config, NOT from request).
+    #[serde(default)]
+    pub api_key: String,
+}
+
+/// NUE client key store — persisted alongside config.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct NUEKeyStore {
+    /// Active NUE client keys (format: nue_<rand>).
+    pub keys: Vec<String>,
+}
+
+impl NUEKeyStore {
+    pub fn path() -> PathBuf {
+        PathBuf::from(home_dir()).join(".nexuslink").join("nue_keys.json")
+    }
+
+    pub fn load() -> Self {
+        let path = Self::path();
+        if path.exists() {
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default()
+        } else {
+            Self::default()
+        }
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let path = Self::path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+        let data = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &data).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {e}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    pub fn add_key(&mut self, key: String) {
+        if !self.keys.contains(&key) {
+            self.keys.push(key);
+        }
+    }
+
+    pub fn validate(&self, key: &str) -> bool {
+        key.starts_with("nue_") && self.keys.iter().any(|k| k == key)
+    }
 }
 
 /// Result of resolving a slot name against the config.
@@ -126,6 +267,10 @@ pub struct Resolved {
     pub context: u64,
     /// Provider's auto-compact flag.
     pub auto_compact: bool,
+    pub scheduling_mode: SchedulingMode,
+    /// Strict pool rank for aliases; prevents provider balancing from
+    /// promoting a lower-ranked model ahead of the benchmark primary.
+    pub route_priority: usize,
 }
 
 #[derive(Debug)]
@@ -196,11 +341,24 @@ pub fn resolve_model(slot: &str, config: &Config) -> Result<Resolved, ResolveErr
 /// Providers without keys still get one candidate (keyless upstreams like
 /// local Ollama legitimately have an empty pool).
 pub fn resolve_candidates(slot: &str, config: &Config) -> Vec<Resolved> {
+    if is_agent_alias(slot) {
+        return AGENT_MODEL_POOL
+            .iter()
+            .enumerate()
+            .flat_map(|(priority, ranked_slot)| {
+                resolve_slot_candidates(ranked_slot, config, priority)
+            })
+            .collect();
+    }
     let wanted = normalized_slot(slot, config);
+    resolve_slot_candidates(&wanted, config, 0)
+}
+
+fn resolve_slot_candidates(slot: &str, config: &Config, route_priority: usize) -> Vec<Resolved> {
     let mut out = Vec::new();
     for p in &config.providers {
         for m in &p.models {
-            if m.slot != wanted || m.name.is_empty() {
+            if m.slot != slot || m.name.is_empty() {
                 continue;
             }
             let url = provider_chat_url(p);
@@ -221,6 +379,8 @@ pub fn resolve_candidates(slot: &str, config: &Config) -> Vec<Resolved> {
                     use_max_completion_tokens: p.use_max_completion_tokens,
                     context: m.context,
                     auto_compact: p.auto_compact,
+                    scheduling_mode: m.scheduling_mode,
+                    route_priority,
                 });
             }
         }
@@ -296,6 +456,21 @@ pub fn window_state_path() -> PathBuf {
     PathBuf::from(home_dir()).join(".nexuslink").join("window.json")
 }
 
+/// WebView2/WebKit profile: cookies, cache, Local Storage.
+///
+/// Must be user-writable. The default WebView2 UDF is `<exe>.WebView2`, i.e.
+/// inside the install dir — that fails with E_ACCESSDENIED when the app is
+/// installed under `Program Files` (the MSI default) and shows a blank window.
+pub fn webview_data_dir() -> PathBuf {
+    // Windows: LOCALAPPDATA, not the roaming profile — WebView2 cannot use a
+    // UNC path, and ~/.nexuslink may be redirected to a network share.
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(local).join("NexusLink").join("WebView2");
+    }
+    PathBuf::from(home_dir()).join(".nexuslink").join("WebView2")
+}
+
 /// Pre-rename config location, honored on read only.
 fn legacy_config_path() -> PathBuf {
     PathBuf::from(home_dir()).join(".openbridge").join("config.json")
@@ -350,7 +525,13 @@ pub fn scaffold() -> Config {
     let mut cfg = Config {
         incoming_token: generate_token(),
         port: DEFAULT_PORT,
+        nue_port: DEFAULT_NUE_PORT,
         providers: Vec::new(),
+        nue_client_keys: Vec::new(),
+        nue_upstream: NUEUpstream::default(),
+        nue_register_token: String::new(),
+        max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+        fallback_slot: String::new(),
     };
     normalize_slots(&mut cfg);
     cfg
@@ -399,6 +580,36 @@ mod tests {
     }
 
     #[test]
+    fn persona_alias_resolves_the_benchmark_ranked_model_pool() {
+        let mut config = Config::default();
+        for (index, slot) in AGENT_MODEL_POOL.iter().enumerate() {
+            config.providers.push(Provider {
+                name: format!("provider-{index}"),
+                base_url: format!("https://provider-{index}.test"),
+                api_key: format!("key-{index}"),
+                models: vec![ModelEntry {
+                    name: (*slot).into(),
+                    slot: (*slot).into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        }
+
+        let candidates = resolve_candidates("agent/alice", &config);
+        assert_eq!(
+            candidates.iter().map(|candidate| candidate.model.as_str()).collect::<Vec<_>>(),
+            AGENT_MODEL_POOL,
+        );
+        assert_eq!(
+            candidates.iter().map(|candidate| candidate.route_priority).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+        );
+        assert_eq!(resolve_candidates("agent/qoder", &config).len(), candidates.len());
+        assert!(resolve_candidates("agent/unknown", &config).is_empty());
+    }
+
+    #[test]
     fn date_suffixed_slot_resolves_to_same_mapping() {
         let r = resolve_model("claude-sonnet-5-20260101", &cfg()).unwrap();
         assert_eq!(r.model, "meta-llama/llama-3.1-70b");
@@ -426,5 +637,42 @@ mod tests {
         c.providers[0].chat_path = "/chat/completions".into();
         let r = resolve_model("claude-sonnet-5", &c).unwrap();
         assert_eq!(r.url, "https://openrouter.ai/api/chat/completions");
+    }
+
+    #[test]
+    fn scheduling_mode_defaults_to_failover_and_round_trips_balanced() {
+        let legacy: Config = serde_json::from_str(r#"{"providers":[{"name":"p","base_url":"https://a","api_key":"k","models":[{"name":"m","slot":"claude-sonnet-5"}]}]}"#).unwrap();
+        let resolved = resolve_model("claude-sonnet-5", &legacy).unwrap();
+        assert_eq!(resolved.scheduling_mode, SchedulingMode::Failover);
+
+        let mut c = legacy;
+        c.providers[0].models[0].scheduling_mode = SchedulingMode::Balanced;
+        let json = serde_json::to_value(&c).unwrap();
+        let restored: Config = serde_json::from_value(json).unwrap();
+        assert_eq!(resolve_model("claude-sonnet-5", &restored).unwrap().scheduling_mode, SchedulingMode::Balanced);
+    }
+
+    #[test]
+    fn max_body_bytes_defaults_to_64_mib_and_round_trips_override() {
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        assert_eq!(
+            value.get("max_body_bytes").and_then(serde_json::Value::as_u64),
+            Some(64 * 1024 * 1024),
+        );
+
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        let legacy = serde_json::to_value(legacy).unwrap();
+        assert_eq!(
+            legacy.get("max_body_bytes").and_then(serde_json::Value::as_u64),
+            Some(64 * 1024 * 1024),
+        );
+
+        value["max_body_bytes"] = serde_json::json!(96 * 1024 * 1024);
+        let restored: Config = serde_json::from_value(value).unwrap();
+        let restored = serde_json::to_value(restored).unwrap();
+        assert_eq!(
+            restored.get("max_body_bytes").and_then(serde_json::Value::as_u64),
+            Some(96 * 1024 * 1024),
+        );
     }
 }

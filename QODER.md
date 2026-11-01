@@ -26,7 +26,7 @@ into OpenAI-compatible requests for pooled upstream providers — Claude Desktop
 | `src/main.rs` | CLI dispatch, AttachConsole pipe-detection, `windows_subsystem` |
 | `src/gateway.rs` | `apply` — writes Claude configs (3p + satellites + `~/.claude.json`) |
 | `src/proxy.rs` | AppState, rotation, fallback, auto-compaction, `state_from_config` |
-| `src/desktop.rs` | frameless tao/wry shell, DWM rounded corners, injected titlebar JS, tray, `~/.nexuslink/window.json` geometry sidecar |
+| `src/desktop.rs` | frameless tao/wry shell, DWM rounded corners, injected titlebar JS, tray, single-instance mutex, `~/.nexuslink/window.json` geometry sidecar |
 | `src/mcp.rs` | stdio MCP server (separate thread + own tokio runtime — do NOT `block_on` inside the main runtime) |
 | `src/translator.rs` | Anthropic ↔ OpenAI translation, SSE |
 | `src/config.rs` | config model (`~/.nexuslink/config.json`), `ModelEntry.context`, `Provider.auto_compact` |
@@ -104,6 +104,9 @@ Verify: `curl http://127.0.0.1:5679/health` → `ok`, `Get-Process nexuslink` sh
 - Release exe stays locked by the running app — always rename before rebuilding.
 - `cargo add` one dep at a time; batch feature flags break the resolver CLI.
 - `windows-sys` 0.59: `HWND` is `*mut c_void` — `SetWindowPos` insertAfter takes `null_mut()`.
+- `windows-sys` 0.59: `CreateMutexW` lives under `Win32::System::Threading` but is
+  gated by the **`Win32_Security`** feature — enabling only `Win32_System_Threading`
+  leaves the import unresolved.
 - wry 0.57: `WebViewBuilder::new()` takes no window; `.build(&window)` gets it.
 - MCP loop must run on its own thread + runtime (`block_on` inside `#[tokio::main]` panics).
 - Claude Desktop Store build spawns MCP servers from `~/.claude.json`, user scope;
@@ -129,8 +132,11 @@ Verify: `curl http://127.0.0.1:5679/health` → `ok`, `Get-Process nexuslink` sh
    immediately on hide/quit; a rect that no longer intersects any monitor is dropped
    so the OS places the window (unplugged-monitor case); while maximized only the
    flag is stored, because a maximized rect overshoots the monitor.
-3. **Single-instance**: `nexuslink app` should focus the existing window instead of
-   opening a second one (mutex/named event).
+3. ~~**Single-instance**~~ — done: `Local\NexusLink-single-instance` named mutex
+   (`single_instance` in `src/desktop.rs`). A second `nexuslink app` never binds
+   the port or builds a window: it finds the running panel with `FindWindowW`,
+   restores it via `ShowWindow(SW_RESTORE)` + `SetForegroundWindow` (works from
+   the tray) and exits in ~200 ms.
 4. **Video MCP**: add `mode: "reference"` support to `generate_video` (images ≤5,
    audios ≤3 per Agnes docs); maybe expose `size` tiers if the plan allows.
 5. **Metrics page**: render per-key success rate/EMA latency in the panel

@@ -277,7 +277,7 @@
   <div class="card gate">
     <h2 data-i18n="gate.title">Gateway token</h2>
     <p class="hint" data-i18n="gate.hint">Paste the incoming_token from your config — it never leaves this page.</p>
-    <input type="password" id="gate-token" data-i18n-ph="gate.ph" placeholder="ob-…">
+    <input type="password" id="gate-token" data-i18n-ph="gate.ph" placeholder="nl-…">
     <button class="btn" data-i18n="gate.go" onclick="enterToken()">Connect</button>
     <p class="hint bad" id="gate-err"></p>
   </div>
@@ -344,7 +344,7 @@ const I18N = {
   en: {
     "tagline": "Anthropic → OpenAI gateway · Claude Desktop",
     "gate.title": "Gateway token", "gate.hint": "Paste the incoming_token from your config — it never leaves this page.",
-    "gate.ph": "ob-…", "gate.go": "Connect", "gate.err": "Rejected — check the token in ~/.nexuslink/config.json",
+    "gate.ph": "nl-…", "gate.go": "Connect", "gate.err": "Rejected — check the token in ~/.nexuslink/config.json",
     "gw.title": "Gateway", "gw.hint": "What Claude Desktop must send; where NexusLink listens.",
     "gw.token": "incoming_token", "gw.show": "show", "gw.hide": "hide", "gw.regen": "regenerate", "gw.copy": "copy",
     "gw.port": "listen port", "gw.claude": "Claude Desktop",
@@ -372,7 +372,7 @@ const I18N = {
   ru: {
     "tagline": "Шлюз Anthropic → OpenAI · Claude Desktop",
     "gate.title": "Токен шлюза", "gate.hint": "Вставь incoming_token из конфига — он не покидает эту страницу.",
-    "gate.ph": "ob-…", "gate.go": "Подключить", "gate.err": "Отказ — проверь токен в ~/.nexuslink/config.json",
+    "gate.ph": "nl-…", "gate.go": "Подключить", "gate.err": "Отказ — проверь токен в ~/.nexuslink/config.json",
     "gw.title": "Шлюз", "gw.hint": "Что шлёт Claude Desktop и где слушает NexusLink.",
     "gw.token": "incoming_token", "gw.show": "показать", "gw.hide": "скрыть", "gw.regen": "пересоздать", "gw.copy": "копировать",
     "gw.port": "порт", "gw.claude": "Claude Desktop",
@@ -506,7 +506,7 @@ function renderSnippet() {
   const port = $("f-port").value || 5679;
   $("snip").textContent =
     `Gateway URL:  http://127.0.0.1:${port}\n` +
-    `API key:      ${cfg.incoming_token || "ob-…"}\n` +
+    `API key:      ${cfg.incoming_token || "nl-…"}\n` +
     `Config file:  ~/.nexuslink/config.json`;
 }
 
@@ -727,7 +727,7 @@ function toggleTok(btn) {
   btn.textContent = t(show ? "gw.hide" : "gw.show");
 }
 function regenTok() {
-  $("f-token").value = "ob-" + Array.from(crypto.getRandomValues(new Uint8Array(16)))
+  $("f-token").value = "nl-" + Array.from(crypto.getRandomValues(new Uint8Array(16)))
     .map((b) => b.toString(16).padStart(2, "0")).join("");
   markDirty(); toast(t("msg.regen"));
 }
